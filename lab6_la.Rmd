@@ -1,0 +1,143 @@
+---
+title: "Part 1"
+author: "Laurel Abowd"
+date: "2/14/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(here)
+library(janitor)
+library(sf)
+library(tmap)
+library(gstat)
+library(stars)
+```
+
+```{r}
+ca_dgw <- read_sf(here("ca_dgw"), layer = "F2013_DBGS_Points_20150720_093252") %>% 
+  clean_names()
+
+st_crs(ca_dgw)
+
+ca_counties <- read_sf(here("ca_counties"), layer = "CA_Counties_TIGER2016") %>% 
+  clean_names() %>% 
+  select(name)
+
+st_crs(ca_counties)
+
+ca_counties <- st_transform(ca_counties, st_crs(ca_dgw))
+
+st_crs(ca_counties)
+
+```
+
+
+```{r}
+ggplot() +
+  geom_sf(data = ca_counties) +
+  geom_sf(data = ca_dgw, aes(color = dgbs))
+```
+
+
+```{r}
+tmap_mode("view")
+
+tm_shape(ca_dgw) +
+  tm_dots("dgbs")
+
+```
+
+
+```{r}
+# Just looking at one county
+sj_county <- ca_counties %>% 
+  filter(name == "San Joaquin")
+
+# Find intersectino betwen depth to gw with SJ county
+sj_depth <- ca_dgw %>% 
+  st_intersection(sj_county)
+
+plot(sj_depth)
+
+ggplot() +
+  geom_sf(data = sj_county) +
+  geom_sf(data = sj_depth, aes(color = dgbs))
+```
+
+Looks like smaller depth to gw is to west and larger values is to the east. So what would the rest of the data in the county look like if we had all that information. We can do this through spatial analysis. 
+
+We have to get rid of singularities (observations in the same exact location) before doing kriging. 
+
+```{r}
+# Find duplicates
+well_duplicates <- sj_depth %>% 
+  get_dupes(latitude, longitude)
+
+# Got two points - just a small part of data, so we can remove it 
+sj_depth <- sj_depth %>% 
+  filter(!local_well %in% well_duplicates$local_well)
+
+sj_depth %>% 
+  get_dupes(latitude, longitude)
+# Yup, got rid of duplicate info
+```
+
+### Create a variogram
+```{r}
+sj_dgw_vgm <- variogram(dgbs ~ 1, data = sj_depth)
+plot(sj_dgw_vgm)
+
+# Find model that fits this spatial variogram and include best estimates of nugget, sill, range
+sj_dgw_vgm_fit <- fit.variogram(sj_dgw_vgm, model = vgm(nugget = 20,
+                                                        psill = 3000,
+                                                        model = "Gau",
+                                                        range = 30))
+
+
+# Let's see how this fits our data
+plot(sj_dgw_vgm, sj_dgw_vgm_fit)
+
+# Check sum of residuals
+attr(sj_dgw_vgm_fit, 'SSErr')
+
+```
+
+### Spatial kriging (interpolation)
+
+```{r}
+# Create a grid around SJ county that the kriging will use for predictions
+sj_grid <- st_bbox(sj_county) %>% 
+  st_as_stars(dx = 0.01, dy = 0.01) %>% 
+  st_set_crs(4326) %>% 
+  st_crop(sj_county)
+
+plot(sj_grid)
+
+```
+
+
+```{r}
+# Spatial kriging
+sj_dgw_krige <- krige(dgbs ~ 1, sj_depth, sj_grid, model = sj_dgw_vgm_fit)
+
+plot(sj_dgw_krige)
+```
+
+```{r}
+# Convert it to a spatial data frame
+krige_df <- as.data.frame(sj_dgw_krige) %>% 
+  st_as_sf(coords = c("x","y")) %>% 
+  drop_na(var1.pred)
+
+st_crs(krige_df) <- 4326
+
+# Then we can use ggplot: 
+ggplot(data = krige_df) +
+  geom_sf(aes(color = var1.pred)) +
+  scale_color_gradient(low = "blue", high = "yellow")
+```
+
+
